@@ -1,357 +1,327 @@
+import time
+
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, multivariate_normal
-from scipy.special import digamma, gammaln
+from scipy.stats import norm
+from scipy.special import digamma
+from scipy.spatial import cKDTree
 from sklearn.neighbors import NearestNeighbors
 from sklearn.base import BaseEstimator, ClassifierMixin
 
-class SemiparametricHNB(BaseEstimator, ClassifierMixin):
-    def __init__(self, k_neighbors=5, ucv_grid_points=20):
-        """
-        Semiparametric Hidden Naive Bayes Classifier
 
-        Parameters:
-        -----------
-        k_neighbors : int
-            k for the k-NN entropy estimation (Kozachenko-Leonenko estimator)
-        bandwidth_method : str
-            Method for bandwidth selection: 'ucv'
-        ucv_grid_points : int
-            Number of grid points for UCV optimization
-        """
+class SemiparametricHNB(BaseEstimator, ClassifierMixin):
+    def __init__(self, k_neighbors=5, ucv_grid_points=20, importance_weight_cap=None,
+                 bandwidth_subsample_size=None):
         self.k_neighbors = k_neighbors
         self.ucv_grid_points = ucv_grid_points
+        self.importance_weight_cap = importance_weight_cap
+        self.bandwidth_subsample_size = bandwidth_subsample_size
 
     def fit(self, X, y):
-        """Fit the Semiparametric HNB model"""
+        t_start = time.perf_counter()
         X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
         y = pd.Series(y) if not isinstance(y, pd.Series) else y
-
         self.X_train_ = X
         self.y_train_ = y
         self.classes_ = np.unique(y)
         self.n_features_ = X.shape[1]
         self.n_samples_ = X.shape[0]
-
         self.feature_types_ = ['continuous'] * self.n_features_
-
-        # 1. Estimate Class Priors with Laplace smoothing
         self._estimate_priors()
-
-        # 2. Estimate Parametric Parameters (Gaussian Start)
         self._estimate_parametric_parameters()
-
-        # 3. Compute Conditional Mutual Information Weights (Equation 3.14)
         self._compute_weights()
-
-        # 4. Select Optimal Bandwidths
         self._select_bandwidth()
-
+        self._select_pairwise_bandwidth()
+        self._precompute_train_densities()
+        self.X_train_groups_ = {c: self.X_train_[self.y_train_ == c].values for c in self.classes_}
+        self.fit_time_seconds_ = time.perf_counter() - t_start
         return self
 
-    def _estimate_priors(self):
-        """Estimate class priors with Laplace smoothing"""
-        counts = self.y_train_.value_counts()
-        self.class_priors_ = {
-            c: (counts.get(c, 0) + 1) / (self.n_samples_ + len(self.classes_))
-            for c in self.classes_
+    @classmethod
+    def fit_family(cls, X, y, k_values, **shared_kwargs):
+        t_shared_start = time.perf_counter()
+
+        base = cls(k_neighbors=k_values[0], **shared_kwargs)
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        y_s = pd.Series(y) if not isinstance(y, pd.Series) else y
+
+        base.X_train_ = X_df
+        base.y_train_ = y_s
+        base.classes_ = np.unique(y_s)
+        base.n_features_ = X_df.shape[1]
+        base.n_samples_ = X_df.shape[0]
+        base.feature_types_ = ['continuous'] * base.n_features_
+
+        base._estimate_priors()
+        base._estimate_parametric_parameters()
+        base._select_bandwidth()
+        base._select_pairwise_bandwidth()
+        base._precompute_train_densities()
+        base.X_train_groups_ = {
+            c: base.X_train_[base.y_train_ == c].values for c in base.classes_
         }
 
-    def _estimate_parametric_parameters(self):
-        """
-        Estimate mean vectors and covariance matrices for the parametric
-        Gaussian start f(x, θ)
-        """
-        self.means_ = {}
-        self.covs_ = {}
-        self.stds_ = {}
+        shared_fit_time = time.perf_counter() - t_shared_start
 
+        shared_attrs = (
+            'X_train_', 'y_train_', 'classes_', 'n_features_', 'n_samples_',
+            'feature_types_', 'class_priors_', 'means_', 'covs_', 'stds_',
+            'bandwidths_', 'bandwidths_pairwise_', 'train_marginal_density_',
+            'train_joint_density_', '_pair_inv_', '_pair_det_', 'X_train_groups_',
+        )
+
+        models = {}
+        for k in k_values:
+            t_own_start = time.perf_counter()
+            m = cls(k_neighbors=k, **shared_kwargs)
+            for attr in shared_attrs:
+                setattr(m, attr, getattr(base, attr))
+            m._compute_weights()  # the only step that actually depends on k
+            own_time = time.perf_counter() - t_own_start
+            m.fit_time_seconds_ = shared_fit_time / len(k_values) + own_time
+            models[k] = m
+
+        return models, shared_fit_time
+
+    def _estimate_priors(self):
+        counts = self.y_train_.value_counts()
+        self.class_priors_ = {c: (counts.get(c, 0) + 1) / (self.n_samples_ + len(self.classes_)) for c in self.classes_}
+
+    def _estimate_parametric_parameters(self):
+        self.means_ = {}; self.covs_ = {}; self.stds_ = {}
         for c in self.classes_:
             Xc = self.X_train_[self.y_train_ == c]
             self.means_[c] = Xc.mean().values
-            # Regularization to prevent singular matrices
             self.covs_[c] = Xc.cov().values + np.eye(self.n_features_) * 1e-6
             self.stds_[c] = np.sqrt(np.diag(self.covs_[c]))
 
     def _compute_weights(self):
-        """
-        Compute weights w_ij based on Conditional Mutual Information (CMI)
-        using k-NN estimator
-
-        I(Ai; Aj | C) = H(Ai,C) + H(Aj,C) - H(C) - H(Ai,Aj,C)
-        """
         d = self.n_features_
+        X_std, C_std = self._standardize_for_cmi()
+        feature_C_trees = self._build_feature_C_trees(X_std, C_std)
+        c_only_tree = cKDTree(C_std.reshape(-1, 1))
         W = np.zeros((d, d))
-
         for i in range(d):
-            for j in range(d):
-                if i != j:
-                    W[i, j] = self._calculate_cmi(i, j)
-
-        # Normalize weights: w_ij = I(Ai;Aj|C) / sum_l I(Ai;Al|C)
+            for j in range(i + 1, d):
+                cmi = self._calculate_cmi(i, j, X_std, C_std, feature_C_trees, c_only_tree)
+                W[i, j] = cmi; W[j, i] = cmi
         row_sums = W.sum(axis=1, keepdims=True)
-        row_sums = np.where(row_sums == 0, 1, row_sums)  # Avoid division by zero
+        row_sums = np.where(row_sums == 0, 1, row_sums)
         self.weights_ = W / row_sums
+        self.parents_ = {j: [(k, self.weights_[j, k]) for k in range(d) if k != j and self.weights_[j, k] > 1e-6] for j in range(d)}
 
-    def _calculate_cmi(self, i, j):
-        """
-        Calculate I(Ai; Aj | C) using k-NN entropy estimator
+    def _standardize_for_cmi(self):
+        X = self.X_train_.values.astype(float)
+        X_std = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+        y = self.y_train_.values
+        class_to_idx = {c: idx for idx, c in enumerate(self.classes_)}
+        C_num = np.array([class_to_idx[c] for c in y], dtype=float)
+        C_std = (C_num - C_num.mean()) / (C_num.std() + 1e-10)
+        return X_std, C_std
 
-        I(Ai; Aj | C) = H(Ai,C) + H(Aj,C) - H(C) - H(Ai,Aj,C)
-        """
-        y_numeric = pd.Categorical(self.y_train_).codes.reshape(-1, 1)
+    def _build_feature_C_trees(self, X_std, C_std):
+        d = self.n_features_
+        return [cKDTree(np.column_stack([X_std[:, k], C_std])) for k in range(d)]
 
-        Xi = self.X_train_.iloc[:, i].values.reshape(-1, 1)
-        Xj = self.X_train_.iloc[:, j].values.reshape(-1, 1)
-
-        # Standardize features for entropy estimation
-        Xi_std = (Xi - Xi.mean()) / (Xi.std() + 1e-10)
-        Xj_std = (Xj - Xj.mean()) / (Xj.std() + 1e-10)
-
-        C = y_numeric / (len(self.classes_) - 1) if len(self.classes_) > 1 else y_numeric
-
-        # Compute entropies
-        H_AiC = self._knn_entropy(np.hstack([Xi_std, C]))
-        H_AjC = self._knn_entropy(np.hstack([Xj_std, C]))
-        H_C = self._knn_entropy(C)
-        H_AiAjC = self._knn_entropy(np.hstack([Xi_std, Xj_std, C]))
-
-        cmi = H_AiC + H_AjC - H_C - H_AiAjC
-
-        return max(cmi, 0.0)  
-
-    def _knn_entropy(self, X):
-        """
-        Kozachenko-Leonenko k-NN entropy estimator
-        """
-        if len(X.shape) == 1:
-            X = X.reshape(-1, 1)
-
-        n, d = X.shape
-
-        if n <= self.k_neighbors:
+    def _calculate_cmi(self, i, j, X_std, C_std, feature_C_trees, c_only_tree):
+        N = X_std.shape[0]
+        K = self.k_neighbors
+        if N <= K + 1:
             return 0.0
 
-        # Fit k-NN
-        nbrs = NearestNeighbors(n_neighbors=self.k_neighbors + 1,
-                               algorithm='auto').fit(X)
-        distances, _ = nbrs.kneighbors(X)
+        Xi_std = X_std[:, i]
+        Xj_std = X_std[:, j]
 
-        # Distance to k-th neighbor
-        eps = distances[:, self.k_neighbors]
+        joint = np.column_stack([Xi_std, Xj_std, C_std])
+        tree_joint = cKDTree(joint)
+        dist, _ = tree_joint.query(joint, k=K + 1)
+        eps = dist[:, K]
 
-        # Avoid log(0)
-        eps = np.maximum(eps, 1e-10)
+        AiC = np.column_stack([Xi_std, C_std])
+        AjC = np.column_stack([Xj_std, C_std])
+        Cc = C_std.reshape(-1, 1)
 
-        # Volume of unit ball in d dimensions: c_d = π^(d/2) / Γ(d/2 + 1)
-        cd = (np.pi ** (d / 2)) / np.exp(gammaln(d / 2 + 1))
+        tree_AiC = feature_C_trees[i]
+        tree_AjC = feature_C_trees[j]
+        tree_C = c_only_tree
 
-        entropy = digamma(n) - digamma(self.k_neighbors) + np.log(cd) + \
-                  (d / n) * np.sum(np.log(eps))
+        cnt_AiC = tree_AiC.query_ball_point(AiC, r=eps, return_length=True)
+        cnt_AjC = tree_AjC.query_ball_point(AjC, r=eps, return_length=True)
+        cnt_C = tree_C.query_ball_point(Cc, r=eps, return_length=True)
 
-        return entropy
+        eta_AiC = np.maximum(cnt_AiC - 1, 1)  # -1 excludes self (distance 0)
+        eta_AjC = np.maximum(cnt_AjC - 1, 1)
+        eta_C = np.maximum(cnt_C - 1, 1)
+
+        cmi = digamma(K) - np.mean(digamma(eta_AiC) + digamma(eta_AjC) - digamma(eta_C))
+        return max(float(cmi), 0.0)
+
+    def _bandwidth_subsample(self, Xc_full):
+        cap = self.bandwidth_subsample_size
+        if cap is None or Xc_full.shape[0] <= cap:
+            return Xc_full
+        rng = np.random.RandomState(0)
+        idx = rng.choice(Xc_full.shape[0], size=cap, replace=False)
+        return Xc_full[idx]
 
     def _select_bandwidth(self):
-        """
-        Bandwidth selection using Unbiased Cross Validation
-        """
         self.bandwidths_ = {}
 
         for c in self.classes_:
-            Xc = self.X_train_[self.y_train_ == c].values
+            Xc_full = self.X_train_[self.y_train_ == c].values
+            Xc = self._bandwidth_subsample(Xc_full)
             n, d = Xc.shape
-            self.bandwidths_[c] = np.zeros(d)
 
-            for dim in range(d):
-                data = Xc[:, dim]
-                std_dev = np.std(data, ddof=1)
+            std_devs = np.std(Xc, axis=0, ddof=1)
+            degenerate = std_devs < 1e-10
+            safe_std = np.where(degenerate, 1.0, std_devs)
 
-                if std_dev < 1e-10:
-                    self.bandwidths_[c][dim] = 1.0
-                    continue
+            diff2 = (Xc[:, None, :] - Xc[None, :, :]) ** 2  # (n, n, d)
+            diag_idx = np.arange(n)
 
-                h = self._ucv_bandwidth(data, std_dev)
-                self.bandwidths_[c][dim] = max(h, 1e-3 * std_dev)
+            r_grid = np.linspace(0.01, 2.0, self.ucv_grid_points)
+            best_h = np.zeros(d)
+            best_score = np.full(d, np.inf)
 
+            for r in r_grid:
+                h = r * safe_std
+                h2 = h ** 2
 
-    def _ucv_bandwidth(self, data, std_dev):
-        """
-        Unbiased Cross-Validation bandwidth selection
-        """
-        data = data.reshape(-1, 1)
-        n = len(data)
+                K2 = np.exp(-diff2 / (4 * h2)[None, None, :])
+                term1 = K2.sum(axis=(0, 1)) / (n ** 2 * h * np.sqrt(4 * np.pi))
 
-        diff2 = (data - data.T) ** 2
-        h_min = 0.1 * std_dev
-        h_max = 2.0 * std_dev
-        h_grid = np.linspace(h_min, h_max, self.ucv_grid_points)
-        best_h = h_grid[0]
-        best_score = np.inf
+                K = np.exp(-diff2 / (2 * h2)[None, None, :])
+                K[diag_idx, diag_idx, :] = 0.0
+                f_loo = K.sum(axis=1) / ((n - 1) * h * np.sqrt(2 * np.pi))
+                term2 = 2 * f_loo.mean(axis=0)
 
-        for h in h_grid:
-          h2 = h * h
-          K2 = np.exp(-diff2 / (4 * h2))
-          term1 = K2.sum() / (n**2 * h * np.sqrt(4 * np.pi))
+                score = term1 - term2
+                improve = score < best_score
+                best_score = np.where(improve, score, best_score)
+                best_h = np.where(improve, h, best_h)
 
-          K = np.exp(-diff2 / (2 * h2))
-          np.fill_diagonal(K, 0.0)
-          f_loo = K.sum(axis=1) / ((n - 1) * h * np.sqrt(2 * np.pi))
-          term2 = 2 * np.mean(f_loo)
+            best_h = np.maximum(best_h, 1e-3 * safe_std)
+            best_h = np.where(degenerate, 1.0, best_h)  # match original: no floor for degenerate dims
+            self.bandwidths_[c] = best_h
 
-          ucv_score = term1 - term2
+    def _select_pairwise_bandwidth(self):
+        self.bandwidths_pairwise_ = {}
+        d = self.n_features_
+        for c in self.classes_:
+            h1d = self.bandwidths_[c]
+            self.bandwidths_pairwise_[c] = {
+                (i, j): (h1d[i], h1d[j])
+                for i in range(d) for j in range(i + 1, d)
+            }
 
-          if ucv_score < best_score:
-            best_score = ucv_score
-            best_h = h
+    def _precompute_train_densities(self):
+        d = self.n_features_
+        self.train_marginal_density_ = {}; self.train_joint_density_ = {}
+        self._pair_inv_ = {}; self._pair_det_ = {}
+        for c in self.classes_:
+            Xc = self.X_train_[self.y_train_ == c].values
+            mu = self.means_[c]; sigma = self.stds_[c]
+            f_marg = norm.pdf(Xc, loc=mu, scale=sigma)
+            self.train_marginal_density_[c] = np.maximum(f_marg, 1e-15)
+            self.train_joint_density_[c] = {}; self._pair_inv_[c] = {}; self._pair_det_[c] = {}
+            for i in range(d):
+                for j in range(i + 1, d):
+                    mu_ij = mu[[i, j]]
+                    cov_ij = self.covs_[c][np.ix_([i, j], [i, j])]
+                    det = cov_ij[0, 0] * cov_ij[1, 1] - cov_ij[0, 1] * cov_ij[1, 0]
+                    det = max(det, 1e-15)
+                    inv = np.array([[cov_ij[1, 1], -cov_ij[0, 1]], [-cov_ij[1, 0], cov_ij[0, 0]]]) / det
+                    diff = Xc[:, [i, j]] - mu_ij
+                    exponent = -0.5 * np.einsum('ni,ij,nj->n', diff, inv, diff)
+                    f_joint = np.exp(exponent) / (2 * np.pi * np.sqrt(det))
+                    self.train_joint_density_[c][(i, j)] = np.maximum(f_joint, 1e-15)
+                    self._pair_inv_[c][(i, j)] = inv
+                    self._pair_det_[c][(i, j)] = det
 
-        best_h = max(best_h, 1e-3 * std_dev)
-        return best_h
+    def _batch_marginal_density(self, X, c, Xc):
+        mu = self.means_[c]; sigma = self.stds_[c]; h = self.bandwidths_[c]
+        d = self.n_features_; n_test = X.shape[0]
+        f_param_x_test = np.maximum(norm.pdf(X, loc=mu, scale=sigma), 1e-15)
+        f_param_Xtrain = self.train_marginal_density_[c]
+        marginal = np.empty((n_test, d))
+        for j in range(d):
+            u = (Xc[:, j][None, :] - X[:, j][:, None]) / h[j]
+            K_h = np.exp(-0.5 * u ** 2) / (np.sqrt(2 * np.pi) * h[j])
+            inv_f_train = 1.0 / f_param_Xtrain[:, j][None, :]
+            if self.importance_weight_cap is not None:
+                inv_f_train = np.minimum(inv_f_train, self.importance_weight_cap)
+            correction = np.mean(K_h * inv_f_train, axis=1)
+            marginal[:, j] = f_param_x_test[:, j] * np.maximum(correction, 1e-10)
+        return np.maximum(marginal, 1e-15)
 
-    def _semiparametric_density_1d(self, x_val, feat_idx, c, X_c_data):
-        h = self.bandwidths_[c][feat_idx]
-        mu = self.means_[c][feat_idx]
-        sigma = self.stds_[c][feat_idx]
+    def _batch_joint_density(self, X, c, Xc, pairs):
+        mu = self.means_[c]; joint = {}
+        for (i, j) in pairs:
+            mu_ij = mu[[i, j]]
+            inv = self._pair_inv_[c][(i, j)]; det = self._pair_det_[c][(i, j)]
+            diff_test = X[:, [i, j]] - mu_ij
+            exponent_test = -0.5 * np.einsum('ni,ij,nj->n', diff_test, inv, diff_test)
+            f_param_x_test = np.maximum(np.exp(exponent_test) / (2 * np.pi * np.sqrt(det)), 1e-15)
+            f_param_Xtrain = self.train_joint_density_[c][(i, j)]
+            h_i, h_j = self.bandwidths_pairwise_[c][(i, j)]
+            diff_i = (Xc[:, i][None, :] - X[:, i][:, None]) / h_i
+            diff_j = (Xc[:, j][None, :] - X[:, j][:, None]) / h_j
+            K_joint = np.exp(-0.5 * (diff_i ** 2 + diff_j ** 2)) / (2 * np.pi * h_i * h_j)
+            inv_f_train = 1.0 / f_param_Xtrain[None, :]
+            if self.importance_weight_cap is not None:
+                inv_f_train = np.minimum(inv_f_train, self.importance_weight_cap)
+            correction = np.mean(K_joint * inv_f_train, axis=1)
+            density = f_param_x_test * np.maximum(correction, 1e-10)
+            joint[(i, j)] = np.maximum(density, 1e-15)
+        return joint
 
-        # Parametric start: f(x, θ̂) - Gaussian (Equation 3.16)
-        f_param_x = norm.pdf(x_val, loc=mu, scale=sigma)
-        f_param_x = max(f_param_x, 1e-15)
-
-        # Training data for this feature/class
-        Xi = X_c_data[:, feat_idx]
-        nc = len(Xi)
-
-        # Parametric start on training data
-        f_param_Xi = norm.pdf(Xi, loc=mu, scale=sigma)
-        f_param_Xi = np.maximum(f_param_Xi, 1e-15)
-
-        # Gaussian kernel: K_h(u) = (1/h√(2π)) * exp(-u²/2h²)
-        u = (Xi - x_val) / h
-        K_h = (1 / (np.sqrt(2 * np.pi) * h)) * np.exp(-0.5 * u**2)
-
-        # Correction factor r̂(x) (Equation 3.17)
-        # r̂(x) = (1/n) Σ K_h(X_i - x) * [f_param(x) / f_param(X_i)]
-        correction = np.mean(K_h * (f_param_x / f_param_Xi))
-
-        # Final semiparametric density (Equation 3.15)
-        density = f_param_x * max(correction, 1e-10)
-
-        return max(density, 1e-15)
-
-    def _semiparametric_density_2d(self, x_i, x_j, i, j, c, X_c_data):
-        """
-        Joint semiparametric density for bivariate case
-        """
-        # Extract bivariate parameters
-        mu_vec = self.means_[c][[i, j]]
-        cov_mat = self.covs_[c][np.ix_([i, j], [i, j])]
-
-        # Parametric start: Bivariate Gaussian
-        x_vec = np.array([x_i, x_j])
-        f_param_x = multivariate_normal.pdf(x_vec, mean=mu_vec, cov=cov_mat)
-        f_param_x = max(f_param_x, 1e-15)
-
-        # Training data subset
-        Xi_data = X_c_data[:, [i, j]]
-        nc = len(Xi_data)
-
-        # f_param on training data
-        f_param_Xi = multivariate_normal.pdf(Xi_data, mean=mu_vec, cov=cov_mat)
-        f_param_Xi = np.maximum(f_param_Xi, 1e-15)
-
-        # Product kernel
-        h_i = self.bandwidths_[c][i]
-        h_j = self.bandwidths_[c][j]
-
-        diff_i = (Xi_data[:, 0] - x_i) / h_i
-        diff_j = (Xi_data[:, 1] - x_j) / h_j
-
-        K_i = (1 / (np.sqrt(2 * np.pi) * h_i)) * np.exp(-0.5 * diff_i**2)
-        K_j = (1 / (np.sqrt(2 * np.pi) * h_j)) * np.exp(-0.5 * diff_j**2)
-        K_joint = K_i * K_j
-
-        # Correction factor r̂(x_i, x_j | C=c)
-        correction = np.mean(K_joint * (f_param_x / f_param_Xi))
-
-        # Final density
-        density = f_param_x * max(correction, 1e-10)
-
-        return max(density, 1e-15)
-
-    def _conditional_prob(self, x_i, x_j, i, j, c, X_c_data):
-        """
-        Calculate P(A_i | A_j, C=c)
-        """
-        joint_prob = self._semiparametric_density_2d(x_i, x_j, i, j, c, X_c_data)
-        marginal_prob_j = self._semiparametric_density_1d(x_j, j, c, X_c_data)
-
-        # Avoid division by zero
-        marginal_prob_j = max(marginal_prob_j, 1e-15)
-
-        return joint_prob / marginal_prob_j
-
-    def predict_proba(self, X):
-        """
-        Predict class probabilities
-        """
-        X = np.array(X)
-        n_test = len(X)
-        probs = np.zeros((n_test, len(self.classes_)))
-
-        # Cache training data by class
-        X_train_groups = {
-            c: self.X_train_[self.y_train_ == c].values
-            for c in self.classes_
-        }
-
-        for idx, x_row in enumerate(X):
-            log_scores = {}
-
+    def predict_proba(self, X, batch_size=512):
+        t_start = time.perf_counter()
+        X = np.asarray(X, dtype=float)
+        n_test = X.shape[0]; d = self.n_features_; n_classes = len(self.classes_)
+        if not hasattr(self, 'train_marginal_density_'): self._precompute_train_densities()
+        if not hasattr(self, 'X_train_groups_'):
+            self.X_train_groups_ = {c: self.X_train_[self.y_train_ == c].values for c in self.classes_}
+        if not hasattr(self, 'parents_'):
+            self.parents_ = {j: [(k, self.weights_[j, k]) for k in range(d) if k != j and self.weights_[j, k] > 1e-6] for j in range(d)}
+        needed_pairs = [(i, j) for i in range(d) for j in range(i + 1, d) if self.weights_[i, j] > 1e-6 or self.weights_[j, i] > 1e-6]
+        if batch_size is None: batch_size = n_test
+        batch_size = max(int(batch_size), 1)
+        probs = np.empty((n_test, n_classes))
+        for start in range(0, n_test, batch_size):
+            end = min(start + batch_size, n_test)
+            X_batch = X[start:end]; n_batch = X_batch.shape[0]
+            log_probs = np.zeros((n_batch, n_classes))
             for c_idx, c in enumerate(self.classes_):
-                # Start with log prior: log P(C=c)
-                log_prob = np.log(self.class_priors_[c])
-
-                X_c_data = X_train_groups[c]
-
-                for j in range(self.n_features_):
-                    term_j = 0.0
-
-                    top_k = 3
-                    parent_idx = np.argsort(self.weights_[j])[::-1][:top_k]
-                    significant_parents = parent_idx[self.weights_[j, parent_idx] > 1e-6]
-
-                    if len(significant_parents) == 0:
-                        marginal_prob = self._semiparametric_density_1d(
-                            x_row[j], j, c, X_c_data
-                        )
-                        term_j = np.log(marginal_prob)
-                    else:
-                        for k in significant_parents:
-                            w_jk = self.weights_[j, k]
-                            cond_prob = self._conditional_prob(
-                                x_row[j], x_row[k], j, k, c, X_c_data
-                            )
-                            term_j += w_jk * np.log(max(cond_prob, 1e-15))
-
-                    log_prob += term_j
-
-                log_scores[c] = log_prob
-
-            # Normalizing for numerical stability
-            max_log = max(log_scores.values())
-            exps = {c: np.exp(val - max_log) for c, val in log_scores.items()}
-            sum_exps = sum(exps.values())
-
-            for c_idx, c in enumerate(self.classes_):
-                probs[idx, c_idx] = exps[c] / sum_exps
-
+                Xc = self.X_train_groups_[c]
+                marginal_density = self._batch_marginal_density(X_batch, c, Xc)
+                joint_density = self._batch_joint_density(X_batch, c, Xc, needed_pairs)
+                log_prob_c = np.full(n_batch, np.log(self.class_priors_[c]))
+                for j in range(d):
+                    hidden_parent_prob = np.zeros(n_batch); weight_sum = 0.0
+                    for k, w_jk in self.parents_[j]:
+                        pair_key = (j, k) if j < k else (k, j)
+                        joint = joint_density.get(pair_key)
+                        if joint is None: continue
+                        cond_prob = joint / marginal_density[:, k]
+                        hidden_parent_prob += w_jk * cond_prob; weight_sum += w_jk
+                    if weight_sum == 0: hidden_parent_prob = marginal_density[:, j]
+                    else: hidden_parent_prob = hidden_parent_prob / weight_sum
+                    log_prob_c += np.log(np.maximum(hidden_parent_prob, 1e-15))
+                log_probs[:, c_idx] = log_prob_c
+            max_log = log_probs.max(axis=1, keepdims=True)
+            exps = np.exp(log_probs - max_log)
+            probs[start:end] = exps / exps.sum(axis=1, keepdims=True)
+        elapsed = time.perf_counter() - t_start
+        self.last_predict_time_seconds_ = elapsed
+        self.last_predict_n_points_ = n_test
+        self.last_predict_seconds_per_point_ = elapsed / max(n_test, 1)
         return probs
 
-    def predict(self, X):
-        """Predict class labels"""
-        probs = self.predict_proba(X)
+    def predict(self, X, batch_size=512):
+        probs = self.predict_proba(X, batch_size=batch_size)
         return self.classes_[np.argmax(probs, axis=1)]
 
-    def score(self, X, y):
-        """Return the mean accuracy on the given test data"""
-        predictions = self.predict(X)
+    def score(self, X, y, batch_size=512):
+        predictions = self.predict(X, batch_size=batch_size)
         return np.mean(predictions == y)
