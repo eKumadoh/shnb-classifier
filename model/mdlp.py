@@ -82,13 +82,9 @@ class Hidden_NB_Supervised:
     def __init__(self, mdlp_min_samples_leaf=1, mdlp_max_depth=None):
         self.mdlp_min_samples_leaf = mdlp_min_samples_leaf
         self.mdlp_max_depth = mdlp_max_depth
-        self.discretizers_ = {}  # col -> sorted list of cut points
+        self.discretizers_ = {}  
         self.continuous_features_ = []
         self.categorical_features_ = []
-        # nu_i (Eq. 9): number of *possible* bins for a discretized feature.
-        # For MDLP this is len(cut_points) + 1 and varies per feature, since
-        # MDLP chooses its own cut points per feature from the training
-        # labels. Populated in _discretize_features(fit=True).
         self.n_categories_ = {}
 
     def fit(self, X, y):
@@ -226,10 +222,6 @@ class Hidden_NB_Supervised:
         return predictions
 
     def _full_labels(self, col):
-        """Full set of nu_i possible bin labels for `col`. MDLP bin codes
-        come from np.digitize (integer dtype), so after the DataFrame-wide
-        astype(str) cast they render as '0', '1', ... (no decimal point,
-        unlike the KBinsDiscretizer-based hnb.py/hnb_EF.py variants)."""
         if col in self.n_categories_:
             return [str(i) for i in range(self.n_categories_[col])]
         return sorted(self.predictors[col].unique())
@@ -241,23 +233,22 @@ class Hidden_NB_Supervised:
 
         all_Ai_labels = self._full_labels(Ai)
         all_Aj_labels = self._full_labels(Aj)
-        nu_i = len(all_Ai_labels)  # Eq. (9): nu_i = number of possible categories of A_i
-
+        nu_i = len(all_Ai_labels)  
+        
         if Ai == Aj:
             counts = Ai_series.value_counts().reindex(all_Ai_labels, fill_value=0)
             smooth_crosstab = pd.DataFrame(0.0, index=all_Ai_labels, columns=all_Ai_labels)
             for label, count in counts.items():
                 smooth_crosstab.loc[label, label] = count
-            smooth_crosstab = smooth_crosstab + 1.0  # Eq. (9) numerator: n_ijc + 1
+            smooth_crosstab = smooth_crosstab + 1.0  
         else:
             smooth_crosstab = (
                 Ai_Aj.groupby([Aj, Ai]).size()
                 .unstack(Ai, fill_value=0)
                 .reindex(index=all_Aj_labels, columns=all_Ai_labels, fill_value=0)
-                + 1.0  # Eq. (9) numerator: n_ijc + 1
+                + 1.0  
             )
 
-        # Eq. (9) denominator: n_jc + nu_i (not n_jc + 1)
         normalizer = Aj_series.value_counts().reindex(all_Aj_labels, fill_value=0) + nu_i
         conditionals = smooth_crosstab.divide(normalizer, axis=0)
         return conditionals
