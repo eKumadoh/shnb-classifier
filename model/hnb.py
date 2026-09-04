@@ -6,21 +6,9 @@ from itertools import product
 from collections import defaultdict
 
 class Hidden_NB():
-    """
-    Hidden_NB implements the Hidden Naive Bayes Classifer from
-    "A Novel Bayes Model: Hidden Naive Bayes" by Jiang, Zhang, and Chai.
 
-    This implementation automatically discretizes continuous features using
-    equal-width binning while preserving categorical features.
-    """
 
     def __init__(self, n_bins=10):
-        """
-        Parameters:
-        -----------
-        n_bins : int, default=10
-            Number of bins for discretizing continuous features
-        """
         self.n_bins = n_bins
         self.discretizers_ = {}
         self.continuous_features_ = []
@@ -28,7 +16,6 @@ class Hidden_NB():
 
 
     def fit(self, X, y):
-        # Convert to DataFrame if necessary
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X, columns=[f'feature_{i}' for i in range(X.shape[1])])
         if not isinstance(y, pd.Series):
@@ -36,15 +23,12 @@ class Hidden_NB():
         
         X = X.copy()
 
-        # Identify different types of features
         self._identify_feature_types(X)
 
-        # Discretize continuous features
         X_processed = self._discretize_features(X, fit=True)
 
         self._set_attributes(X_processed, y)
 
-        # Calculate conditionals p(a_i, a_c, c) for each attribute pair
         predictor_names = product(X_processed.columns, repeat=2)
         self._attribute_pair_conditionals = defaultdict(lambda: defaultdict(dict))
         for Ai, Aj in predictor_names:
@@ -57,37 +41,24 @@ class Hidden_NB():
 
 
     def predict(self, X):
-        # Convert to DataFrame if necessary
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X, columns=[f'feature_{i}' for i in range(X.shape[1])])
         
         X = X.copy()
 
-        # Discretize using fitted discretizers
         X_processed = self._discretize_features(X, fit=False)
 
         return X_processed.apply(self._classify_record, axis=1)
 
 
     def predict_proba(self, X):
-        """
-        Predict class probabilities for X.
-        
-        Returns:
-        --------
-        proba : array-like, shape (n_samples, n_classes)
-            Class probabilities
-        """
-        # Convert to DataFrame if necessary
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X, columns=[f'feature_{i}' for i in range(X.shape[1])])
         
         X = X.copy()
         
-        # Discretize using fitted discretizers
         X_processed = self._discretize_features(X, fit=False)
         
-        # Get probabilities for each sample
         probas = []
         for _, record in X_processed.iterrows():
             class_probs = {}
@@ -96,13 +67,11 @@ class Hidden_NB():
                                           for Ai, ai in record.items()])
                 class_probs[c] = np.exp(np.sum(np.log(hidden_parents)) + np.log(self._p_c[c]))
             
-            # Normalize to get probabilities
             total = sum(class_probs.values())
             if total == 0:
                 total = 1e-10
             normalized_probs = {c: prob/total for c, prob in class_probs.items()}
             
-            # Convert to array in order of self.classes
             prob_array = [normalized_probs[c] for c in sorted(self.classes)]
             probas.append(prob_array)
         
@@ -115,7 +84,6 @@ class Hidden_NB():
         self.categorical_features_ = []
 
         for col in X.columns:
-            # Check if column is numeric
             if pd.api.types.is_numeric_dtype(X[col]):
                 if X[col].dtype == float or X[col].nunique() > 10:
                     self.continuous_features_.append(col)
@@ -128,7 +96,6 @@ class Hidden_NB():
     def _discretize_features(self, X, fit=True):
         X_processed = X.copy()
 
-        # Discretize continuous features
         for col in self.continuous_features_:
             if fit:
                 discretizer = KBinsDiscretizer(
@@ -189,7 +156,6 @@ class Hidden_NB():
 
 
     def _generate_attribute_pair_conditional(self, Ai, Aj, c):
-        # Calculates conditional for single pair of attributes
         Ai_series = self.predictors.loc[self.target==c, Ai]
         Aj_series = self.predictors.loc[self.target==c, Aj]
         Ai_Aj = self.predictors.loc[self.target==c, [Ai, Aj]]
@@ -214,7 +180,6 @@ class Hidden_NB():
 
 
     def _conditional_MI(self, Ai, Aj):
-        # Calculates conditional mutual information for a single pair of attributes
         CMI = 0
         if (Ai==Aj):
             return CMI
@@ -227,7 +192,6 @@ class Hidden_NB():
 
 
     def _all_conditional_MI(self):
-        # Calculates conditional mutual information for all attributes
         all_CMI_array = [[self._conditional_MI(Ai, Aj) for Ai in self.predictors.columns]
                          for Aj in self.predictors.columns]
         all_CMI = pd.DataFrame(all_CMI_array, index=self.predictors.columns, columns=self.predictors.columns)
