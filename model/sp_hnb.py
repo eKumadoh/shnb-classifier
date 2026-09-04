@@ -99,24 +99,10 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
             self.covs_[c] = Xc.cov().values + np.eye(self.n_features_) * 1e-6
             self.stds_[c] = np.sqrt(np.diag(self.covs_[c]))
 
-    # ------------------------------------------------------------------
-    # CMI estimation: per-class KSG, combined via class priors.
-    #
-    # The class label C never enters a continuous distance computation.
-    # For each pair (i, j) we estimate the ORDINARY (unconditional) KSG
-    # mutual information between A_i and A_j using only the n_c points in
-    # class c, then combine:
-    #
-    #     I(A_i; A_j | C) = sum_c P(c) * I(A_i; A_j | C = c)
-    #
-    # ------------------------------------------------------------------
-
+    
     def _compute_weights(self):
         d = self.n_features_
         X = self.X_train_.values.astype(float)
-        # Global standardisation (matches the original convention); MI is
-        # theoretically invariant to per-coordinate rescaling, this just
-        # keeps distances on a comparable numeric scale across features.
         X_std = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
 
         y = self.y_train_.values
@@ -130,9 +116,6 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
                 for c in self.classes_:
                     idx = class_indices[c]
                     if len(idx) <= self.k_neighbors + 1:
-                        # Too few points in this class to estimate MI
-                        # reliably at this K; that class contributes 0 to
-                        # the weighted sum rather than raising an error.
                         continue
                     Xc_pair = X_std[idx][:, [i, j]]
                     mi_c = self._ksg_mutual_information(Xc_pair, self.k_neighbors)
@@ -150,11 +133,6 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
 
     @staticmethod
     def _ksg_mutual_information(XY, k):
-        """Standard KSG (Kraskov, Stogbauer & Grassberger, 2004) mutual
-        information estimator, Algorithm 1 (max-norm), for two continuous
-        variables. XY has shape (n_c, 2): columns are the two features,
-        restricted to points from a single class. No class-label coordinate
-        is present anywhere in this computation."""
         n = XY.shape[0]
         if n <= k + 1:
             return 0.0
@@ -196,7 +174,7 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
             degenerate = std_devs < 1e-10
             safe_std = np.where(degenerate, 1.0, std_devs)
 
-            diff2 = (Xc[:, None, :] - Xc[None, :, :]) ** 2  # (n, n, d)
+            diff2 = (Xc[:, None, :] - Xc[None, :, :]) ** 2  
             diag_idx = np.arange(n)
 
             r_grid = np.linspace(0.01, 2.0, self.ucv_grid_points)
@@ -405,9 +383,6 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
                         if weight_sum == 0: hidden_parent_prob = marginal_density[:, j]
                         else: hidden_parent_prob = hidden_parent_prob / weight_sum
                     else:
-                        # No hidden parent for this feature, or ablation
-                        # (use_hidden_parents=False): fall back to the
-                        # marginal semiparametric density directly.
                         hidden_parent_prob = marginal_density[:, j]
                     log_prob_c += np.log(np.maximum(hidden_parent_prob, 1e-15))
                 log_probs[:, c_idx] = log_prob_c
