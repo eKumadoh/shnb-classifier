@@ -1,21 +1,20 @@
 import time
-
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from scipy.special import digamma
 from scipy.spatial import cKDTree
-from sklearn.neighbors import NearestNeighbors
 from sklearn.base import BaseEstimator, ClassifierMixin
 
 
 class SemiparametricHNB(BaseEstimator, ClassifierMixin):
     def __init__(self, k_neighbors=5, ucv_grid_points=20, importance_weight_cap=None,
-                 bandwidth_subsample_size=None):
+                 bandwidth_subsample_size=None, use_hidden_parents=True):
         self.k_neighbors = k_neighbors
         self.ucv_grid_points = ucv_grid_points
         self.importance_weight_cap = importance_weight_cap
         self.bandwidth_subsample_size = bandwidth_subsample_size
+        self.use_hidden_parents = use_hidden_parents
 
     def fit(self, X, y):
         t_start = time.perf_counter()
@@ -29,7 +28,12 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
         self.feature_types_ = ['continuous'] * self.n_features_
         self._estimate_priors()
         self._estimate_parametric_parameters()
-        self._compute_weights()
+        if self.use_hidden_parents:
+            self._compute_weights()
+        else:
+            d = self.n_features_
+            self.weights_ = np.zeros((d, d))
+            self.parents_ = {j: [] for j in range(d)}
         self._select_bandwidth()
         self._select_pairwise_bandwidth()
         self._precompute_train_densities()
@@ -95,66 +99,82 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
             self.covs_[c] = Xc.cov().values + np.eye(self.n_features_) * 1e-6
             self.stds_[c] = np.sqrt(np.diag(self.covs_[c]))
 
+    # ------------------------------------------------------------------
+    # CMI estimation: per-class KSG, combined via class priors.
+    #
+    # The class label C never enters a continuous distance computation.
+    # For each pair (i, j) we estimate the ORDINARY (unconditional) KSG
+    # mutual information between A_i and A_j using only the n_c points in
+    # class c, then combine:
+    #
+    #     I(A_i; A_j | C) = sum_c P(c) * I(A_i; A_j | C = c)
+    #
+    # ------------------------------------------------------------------
+
     def _compute_weights(self):
         d = self.n_features_
-        X_std, C_std = self._standardize_for_cmi()
-        feature_C_trees = self._build_feature_C_trees(X_std, C_std)
-        c_only_tree = cKDTree(C_std.reshape(-1, 1))
+        X = self.X_train_.values.astype(float)
+        # Global standardisation (matches the original convention); MI is
+        # theoretically invariant to per-coordinate rescaling, this just
+        # keeps distances on a comparable numeric scale across features.
+        X_std = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+
+        y = self.y_train_.values
+        class_indices = {c: np.where(y == c)[0] for c in self.classes_}
+        class_prior_mi = {c: len(idx) / self.n_samples_ for c, idx in class_indices.items()}
+
         W = np.zeros((d, d))
         for i in range(d):
             for j in range(i + 1, d):
-                cmi = self._calculate_cmi(i, j, X_std, C_std, feature_C_trees, c_only_tree)
-                W[i, j] = cmi; W[j, i] = cmi
+                cmi = 0.0
+                for c in self.classes_:
+                    idx = class_indices[c]
+                    if len(idx) <= self.k_neighbors + 1:
+                        # Too few points in this class to estimate MI
+                        # reliably at this K; that class contributes 0 to
+                        # the weighted sum rather than raising an error.
+                        continue
+                    Xc_pair = X_std[idx][:, [i, j]]
+                    mi_c = self._ksg_mutual_information(Xc_pair, self.k_neighbors)
+                    cmi += class_prior_mi[c] * mi_c
+                W[i, j] = cmi
+                W[j, i] = cmi
+
         row_sums = W.sum(axis=1, keepdims=True)
         row_sums = np.where(row_sums == 0, 1, row_sums)
         self.weights_ = W / row_sums
-        self.parents_ = {j: [(k, self.weights_[j, k]) for k in range(d) if k != j and self.weights_[j, k] > 1e-6] for j in range(d)}
+        self.parents_ = {
+            j: [(k, self.weights_[j, k]) for k in range(d) if k != j and self.weights_[j, k] > 1e-6]
+            for j in range(d)
+        }
 
-    def _standardize_for_cmi(self):
-        X = self.X_train_.values.astype(float)
-        X_std = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
-        y = self.y_train_.values
-        class_to_idx = {c: idx for idx, c in enumerate(self.classes_)}
-        C_num = np.array([class_to_idx[c] for c in y], dtype=float)
-        C_std = (C_num - C_num.mean()) / (C_num.std() + 1e-10)
-        return X_std, C_std
-
-    def _build_feature_C_trees(self, X_std, C_std):
-        d = self.n_features_
-        return [cKDTree(np.column_stack([X_std[:, k], C_std])) for k in range(d)]
-
-    def _calculate_cmi(self, i, j, X_std, C_std, feature_C_trees, c_only_tree):
-        N = X_std.shape[0]
-        K = self.k_neighbors
-        if N <= K + 1:
+    @staticmethod
+    def _ksg_mutual_information(XY, k):
+        """Standard KSG (Kraskov, Stogbauer & Grassberger, 2004) mutual
+        information estimator, Algorithm 1 (max-norm), for two continuous
+        variables. XY has shape (n_c, 2): columns are the two features,
+        restricted to points from a single class. No class-label coordinate
+        is present anywhere in this computation."""
+        n = XY.shape[0]
+        if n <= k + 1:
             return 0.0
 
-        Xi_std = X_std[:, i]
-        Xj_std = X_std[:, j]
+        tree_xy = cKDTree(XY)
+        dist, _ = tree_xy.query(XY, k=k + 1, p=np.inf)
+        eps = dist[:, k]
 
-        joint = np.column_stack([Xi_std, Xj_std, C_std])
-        tree_joint = cKDTree(joint)
-        dist, _ = tree_joint.query(joint, k=K + 1)
-        eps = dist[:, K]
+        x = XY[:, [0]]
+        y = XY[:, [1]]
+        tree_x = cKDTree(x)
+        tree_y = cKDTree(y)
 
-        AiC = np.column_stack([Xi_std, C_std])
-        AjC = np.column_stack([Xj_std, C_std])
-        Cc = C_std.reshape(-1, 1)
+        nx = tree_x.query_ball_point(x, r=eps, p=np.inf, return_length=True) - 1
+        ny = tree_y.query_ball_point(y, r=eps, p=np.inf, return_length=True) - 1
+        nx = np.maximum(nx, 1)
+        ny = np.maximum(ny, 1)
 
-        tree_AiC = feature_C_trees[i]
-        tree_AjC = feature_C_trees[j]
-        tree_C = c_only_tree
-
-        cnt_AiC = tree_AiC.query_ball_point(AiC, r=eps, return_length=True)
-        cnt_AjC = tree_AjC.query_ball_point(AjC, r=eps, return_length=True)
-        cnt_C = tree_C.query_ball_point(Cc, r=eps, return_length=True)
-
-        eta_AiC = np.maximum(cnt_AiC - 1, 1)  # -1 excludes self (distance 0)
-        eta_AjC = np.maximum(cnt_AjC - 1, 1)
-        eta_C = np.maximum(cnt_C - 1, 1)
-
-        cmi = digamma(K) - np.mean(digamma(eta_AiC) + digamma(eta_AjC) - digamma(eta_C))
-        return max(float(cmi), 0.0)
+        mi = digamma(k) + digamma(n) - np.mean(digamma(nx) + digamma(ny))
+        return max(float(mi), 0.0)
 
     def _bandwidth_subsample(self, Xc_full):
         cap = self.bandwidth_subsample_size
@@ -201,7 +221,7 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
                 best_h = np.where(improve, h, best_h)
 
             best_h = np.maximum(best_h, 1e-3 * safe_std)
-            best_h = np.where(degenerate, 1.0, best_h)  # match original: no floor for degenerate dims
+            best_h = np.where(degenerate, 1.0, best_h)
             self.bandwidths_[c] = best_h
 
     def _select_pairwise_bandwidth(self):
@@ -213,6 +233,74 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
                 (i, j): (h1d[i], h1d[j])
                 for i in range(d) for j in range(i + 1, d)
             }
+
+    @staticmethod
+    def _bivariate_ucv_score(Xc_pair, h1, h2):
+        """2D product-Gaussian-kernel UCV objective, generalising the
+        univariate objective used in _select_bandwidth to two dimensions."""
+        n = Xc_pair.shape[0]
+        diff1 = Xc_pair[:, None, 0] - Xc_pair[None, :, 0]
+        diff2 = Xc_pair[:, None, 1] - Xc_pair[None, :, 1]
+
+        conv1 = np.exp(-diff1 ** 2 / (4 * h1 ** 2)) / (h1 * np.sqrt(4 * np.pi))
+        conv2 = np.exp(-diff2 ** 2 / (4 * h2 ** 2)) / (h2 * np.sqrt(4 * np.pi))
+        term1 = (conv1 * conv2).sum() / n ** 2
+
+        K1 = np.exp(-0.5 * (diff1 / h1) ** 2) / (h1 * np.sqrt(2 * np.pi))
+        K2 = np.exp(-0.5 * (diff2 / h2) ** 2) / (h2 * np.sqrt(2 * np.pi))
+        K = K1 * K2
+        np.fill_diagonal(K, 0.0)
+        f_loo = K.sum(axis=1) / (n - 1)
+        term2 = 2 * f_loo.mean()
+
+        return term1 - term2
+
+    @classmethod
+    def _select_joint_bivariate_bandwidth(cls, Xc_pair, grid_points=8, r_range=(0.05, 1.5)):
+        """Jointly optimise (h_i, h_j) via 2D grid search on the bivariate
+        UCV objective. Used only for the sensitivity check, not the
+        production pipeline (which uses the cheaper per-feature product
+        bandwidths already selected in _select_bandwidth)."""
+        std = np.std(Xc_pair, axis=0, ddof=1)
+        std = np.where(std < 1e-10, 1.0, std)
+        r_grid = np.linspace(r_range[0], r_range[1], grid_points)
+
+        best_score = np.inf
+        best_h = (std[0], std[1])
+        for r1 in r_grid:
+            h1 = r1 * std[0]
+            for r2 in r_grid:
+                h2 = r2 * std[1]
+                score = cls._bivariate_ucv_score(Xc_pair, h1, h2)
+                if score < best_score:
+                    best_score = score
+                    best_h = (h1, h2)
+        return best_h, best_score
+
+    def bivariate_bandwidth_sensitivity_check(self, i, j, grid_points=8):
+        """Compare the production diagonal product-kernel bandwidths
+        (independent univariate UCV per feature) against a jointly
+        optimised bivariate UCV bandwidth for the (i, j) pair, per class.
+
+        Returns a dict keyed by class with both bandwidth pairs and their
+        UCV scores, so the relative gap can be reported as a sensitivity
+        diagnostic (Section 2.3.3)."""
+        results = {}
+        for c in self.classes_:
+            Xc_pair = self.X_train_groups_[c][:, [i, j]]
+            h1_prod, h2_prod = self.bandwidths_pairwise_[c][(i, j)]
+            score_prod = self._bivariate_ucv_score(Xc_pair, h1_prod, h2_prod)
+            (h1_joint, h2_joint), score_joint = self._select_joint_bivariate_bandwidth(
+                Xc_pair, grid_points=grid_points
+            )
+            results[c] = {
+                'h_product': (float(h1_prod), float(h2_prod)),
+                'ucv_product': float(score_prod),
+                'h_joint': (float(h1_joint), float(h2_joint)),
+                'ucv_joint': float(score_joint),
+                'ucv_relative_gap': float((score_prod - score_joint) / abs(score_joint)) if score_joint != 0 else np.nan,
+            }
+        return results
 
     def _precompute_train_densities(self):
         d = self.n_features_
@@ -283,8 +371,16 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
         if not hasattr(self, 'X_train_groups_'):
             self.X_train_groups_ = {c: self.X_train_[self.y_train_ == c].values for c in self.classes_}
         if not hasattr(self, 'parents_'):
-            self.parents_ = {j: [(k, self.weights_[j, k]) for k in range(d) if k != j and self.weights_[j, k] > 1e-6] for j in range(d)}
-        needed_pairs = [(i, j) for i in range(d) for j in range(i + 1, d) if self.weights_[i, j] > 1e-6 or self.weights_[j, i] > 1e-6]
+            self.parents_ = {j: [] for j in range(d)}
+
+        if self.use_hidden_parents:
+            needed_pairs = [
+                (i, j) for i in range(d) for j in range(i + 1, d)
+                if self.weights_[i, j] > 1e-6 or self.weights_[j, i] > 1e-6
+            ]
+        else:
+            needed_pairs = []  # ablation: never touch pairwise densities
+
         if batch_size is None: batch_size = n_test
         batch_size = max(int(batch_size), 1)
         probs = np.empty((n_test, n_classes))
@@ -295,18 +391,24 @@ class SemiparametricHNB(BaseEstimator, ClassifierMixin):
             for c_idx, c in enumerate(self.classes_):
                 Xc = self.X_train_groups_[c]
                 marginal_density = self._batch_marginal_density(X_batch, c, Xc)
-                joint_density = self._batch_joint_density(X_batch, c, Xc, needed_pairs)
+                joint_density = self._batch_joint_density(X_batch, c, Xc, needed_pairs) if needed_pairs else {}
                 log_prob_c = np.full(n_batch, np.log(self.class_priors_[c]))
                 for j in range(d):
-                    hidden_parent_prob = np.zeros(n_batch); weight_sum = 0.0
-                    for k, w_jk in self.parents_[j]:
-                        pair_key = (j, k) if j < k else (k, j)
-                        joint = joint_density.get(pair_key)
-                        if joint is None: continue
-                        cond_prob = joint / marginal_density[:, k]
-                        hidden_parent_prob += w_jk * cond_prob; weight_sum += w_jk
-                    if weight_sum == 0: hidden_parent_prob = marginal_density[:, j]
-                    else: hidden_parent_prob = hidden_parent_prob / weight_sum
+                    if self.use_hidden_parents and self.parents_[j]:
+                        hidden_parent_prob = np.zeros(n_batch); weight_sum = 0.0
+                        for k, w_jk in self.parents_[j]:
+                            pair_key = (j, k) if j < k else (k, j)
+                            joint = joint_density.get(pair_key)
+                            if joint is None: continue
+                            cond_prob = joint / marginal_density[:, k]
+                            hidden_parent_prob += w_jk * cond_prob; weight_sum += w_jk
+                        if weight_sum == 0: hidden_parent_prob = marginal_density[:, j]
+                        else: hidden_parent_prob = hidden_parent_prob / weight_sum
+                    else:
+                        # No hidden parent for this feature, or ablation
+                        # (use_hidden_parents=False): fall back to the
+                        # marginal semiparametric density directly.
+                        hidden_parent_prob = marginal_density[:, j]
                     log_prob_c += np.log(np.maximum(hidden_parent_prob, 1e-15))
                 log_probs[:, c_idx] = log_prob_c
             max_log = log_probs.max(axis=1, keepdims=True)
