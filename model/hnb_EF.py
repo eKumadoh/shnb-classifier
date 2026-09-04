@@ -7,20 +7,12 @@ from collections import defaultdict
 
 
 class Hidden_NB_EqualFrequency():
-    """
-    Hidden Naive Bayes (Jiang, Zhang & Chai) with equal-frequency
-    (quantile) discretization of continuous features instead of Zhang's
-    equal-width binning.
-    """
-
+    
     def __init__(self, n_bins=10):
         self.n_bins = n_bins
         self.discretizers_ = {}
         self.continuous_features_ = []
         self.categorical_features_ = []
-        # nu_i (Eq. 9): number of *possible* bins for a discretized feature,
-        # fixed at fit time, independent of which bins are actually observed
-        # in the training data. Populated in _discretize_features(fit=True).
         self.n_categories_ = {}
 
     def fit(self, X, y):
@@ -109,9 +101,6 @@ class Hidden_NB_EqualFrequency():
                     )
                     X_processed[col] = discretizer.fit_transform(X[[col]]).flatten()
                 self.discretizers_[col] = discretizer
-                # KBinsDiscretizer can silently return fewer bins than
-                # requested (e.g. duplicate quantile edges); use the actual
-                # fitted bin count as nu_i, not self.n_bins.
                 self.n_categories_[col] = int(discretizer.n_bins_[0])
             else:
                 if col in self.discretizers_:
@@ -187,10 +176,9 @@ class Hidden_NB_EqualFrequency():
                 Ai_Aj.groupby([Aj, Ai]).size()
                 .unstack(Ai, fill_value=0)
                 .reindex(index=all_Aj_labels, columns=all_Ai_labels, fill_value=0)
-                + 1.0  # Eq. (9) numerator: n_ijc + 1
+                + 1.0  
             )
 
-        # Eq. (9) denominator: n_jc + nu_i (not n_jc + 1)
         normalizer = Aj_series.value_counts().reindex(all_Aj_labels, fill_value=0) + nu_i
         conditionals = smooth_crosstab.divide(normalizer, axis=0)
         return conditionals
